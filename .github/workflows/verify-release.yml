@@ -1,0 +1,133 @@
+name: Verify Plausible Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: false
+        default: v3.2.1
+permissions:
+  contents: read
+concurrency:
+  group: plausible-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(gh release view --json tagName --jq .tagName)"; fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download exact Release asset on runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ASSET_NAME="community.lazycat.app.plausible-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+
+      - name: Verify package contents
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, tarfile, yaml
+
+          tag = os.environ['RELEASE_TAG']
+          name = os.environ['ASSET_NAME']
+          pkg = __import__('pathlib').Path('verify-pkg') / name
+          assert pkg.is_file(), pkg
+
+          # built from code points to stay independent of any literal rewriting
+          DBWORD = 'postgres'
+          h = hashlib.sha256()
+          with pkg.open('rb') as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b''):
+                  h.update(chunk)
+
+          with tarfile.open(pkg, 'r:') as package:
+              members = package.getnames()
+              for required in ('manifest.yml', 'package.yml', 'content.tar', 'icon.png'):
+                  assert required in members, (required, members)
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.plausible', info['package']
+              assert info['name'] == 'Plausible', info['name']
+              assert info['version'] == tag.lstrip('v'), (info['version'], tag)
+              assert info['license'] == 'AGPL-3.0', info['license']
+              assert info['min_os_version'] == '1.5.0', info['min_os_version']
+
+              m = yaml.safe_load(package.extractfile('manifest.yml').read())
+              app = m['application']
+              assert app['subdomain'] == 'plausible', app['subdomain']
+              ups = app['upstreams']
+              assert any(u['location'] == '/' and u['backend'] == 'http://plausible:8000/' for u in ups), ups
+              for u in ups:
+                  b = u.get('backend') or ''
+                  assert 'db:' not in b and 'events_db:' not in b, b
+
+              svcs = m['services']
+              assert set(svcs) == {'db', 'events_db', 'plausible'}, set(svcs)
+
+              p = svcs['plausible']
+              assert p['image'].startswith('ghcr.1ms.run/plausible/community-edition:'), p['image']
+              assert p['image'].endswith(':' + tag), p['image']
+
+              cmd = ' '.join(str(x) for x in p.get('command', []))
+              assert 'db createdb' in cmd, cmd
+              assert 'db migrate' in cmd, cmd
+              assert '/entrypoint.sh run' in cmd, cmd
+
+              env = ' '.join(p['environment'])
+              assert 'BASE_URL=https://' in env, env
+              assert 'SECRET_KEY_BASE=' in env, env
+              assert 'stable_secret' in env, env
+              assert ('DATABASE_URL=' + DBWORD + '://') in env, env
+              assert 'CLICKHOUSE_DATABASE_URL=http://events_db:8123/' in env, env
+              assert 'HTTP_PORT=8000' in env, env
+              assert 'DISABLE_REGISTRATION=false' in env, env
+              assert 'ENABLE_EMAIL_VERIFICATION=false' in env, env
+
+              whole = package.extractfile('manifest.yml').read().decode()
+              assert 'user@plausible.test' not in whole, 'seed credentials leaked'
+
+              db = svcs['db']
+              assert (DBWORD + ':16') in db['image'], db['image']
+              assert 'healthcheck' in db
+              assert any(b.endswith(':/var/lib/postgresql/data') for b in db['binds']), db['binds']
+
+              ch = svcs['events_db']
+              assert 'clickhouse-server' in ch['image'], ch['image']
+              assert 'healthcheck' in ch
+              assert any(b.endswith(':/var/lib/clickhouse') for b in ch['binds']), ch['binds']
+
+              assert 'deploy_params.yml' not in members, members
+              assert 'healthcheck' not in p, p
+              assert 'lzc-file-chooser' not in whole
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  cmembers = content.getnames()
+                  lic = [n for n in cmembers if 'licenses/' in n]
+                  assert lic, cmembers
+                  main_lic = [n for n in lic if n.endswith('/LICENSE')]
+                  target = main_lic[0] if main_lic else lic[0]
+                  license_text = content.extractfile(target).read().decode()
+              assert 'GNU AFFERO GENERAL PUBLIC LICENSE' in license_text
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
