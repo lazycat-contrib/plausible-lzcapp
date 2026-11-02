@@ -1,0 +1,18 @@
+package: community.lazycat.app.plausible
+name: Plausible
+version: 0.0.0
+description: "Cookie-free web analytics: lightweight, privacy-friendly visitor stats you host yourself."
+min_os_version: "1.5.0"
+homepage: https://plausible.io/
+author: Plausible Analytics
+license: AGPL-3.0
+permissions:
+  required:
+    - net.internet
+locales:
+  zh:
+    name: Plausible
+    description: "不用 cookie 的网站统计：轻量、注重隐私，数据全在自己设备上。"
+  en:
+    name: Plausible
+    description: "Cookie-free web analytics: lightweight, privacy-friendly visitor stats you host yourself."
